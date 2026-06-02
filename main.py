@@ -1,3 +1,4 @@
+import os
 import mysql.connector
 from mysql.connector import pooling
 from fastapi import FastAPI, HTTPException, Depends, status
@@ -5,6 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any
 from datetime import date
+from dotenv import load_dotenv
+
+# Memuat konfigurasi dari file .env jika ada
+load_dotenv()
 
 app = FastAPI(
     title="Sistem Informasi Kas RW - Keuangan Transparan",
@@ -17,25 +22,31 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://3.233.82.68",       
-        "http://3.233.82.68:80"   
+        "http://3.233.82.68:80",
+        "http://kasrw3.org",
+        "https://kasrw3.org",
+        "http://localhost",
+        "http://localhost:3000"
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Konfigurasi Database Pooling
+# Konfigurasi Database Pooling (Membaca dari file .env)
 db_config = {
     "pool_name": "kas_rw_pool",
     "pool_size": 5,
-    "host": "localhost",
-    "user": "root",
-    "password": "@password123",  
-    "database": "kas_rw_db"
+    "host": os.getenv("DB_HOST", "localhost"),       # Di dalam Docker, arahkan ke IP Host / IP MySQL Anda
+    "port": int(os.getenv("DB_PORT", 3306)),
+    "user": os.getenv("DB_USER", "root"),
+    "password": os.getenv("DB_PASSWORD", "@password123"),  
+    "database": os.getenv("DB_NAME", "kas_rw_db")
 }
 
 try:
     connection_pool = pooling.MySQLConnectionPool(**db_config)
+    print("Database Connection Pool berhasil diinisialisasi.")
 except mysql.connector.Error as err:
     print(f"Error Database Connection Pool: {err}")
     connection_pool = None
@@ -129,7 +140,7 @@ def get_all_transaksi(db=Depends(get_db)):
         "data": riwayat
     }
 
-@app.post("/api/transaksi", status_code=status.HTTP_21_CREATED)
+@app.post("/api/transaksi", status_code=status.HTTP_201_CREATED)
 def create_transaksi(payload: TransaksiCreate, db=Depends(get_db)):
     if payload.jenis not in ['pemasukan', 'pengeluaran']:
         raise HTTPException(status_code=400, detail="Jenis transaksi tidak valid.")
@@ -196,5 +207,4 @@ def delete_transaksi(transaksi_id: int, db=Depends(get_db)):
 
 if __name__ == "__main__":
     import uvicorn
-    # Menggunakan 0.0.0.0 agar backend bisa diakses secara publik via IP 18.210.54.99
-    uvicorn.run("main.py:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
