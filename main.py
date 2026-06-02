@@ -1,178 +1,200 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-from datetime import date
 import mysql.connector
-import os
-from dotenv import load_dotenv
+from mysql.connector import pooling
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any
+from datetime import date
 
-load_dotenv()
+app = FastAPI(
+    title="Sistem Informasi Kas RW - Keuangan Transparan",
+    description="Backend API untuk pengelolaan kas warga yang aman dan akuntabel.",
+    version="1.0.0"
+)
 
-app = FastAPI(title="Kas RW API")
-
+# Mengaktifkan CORS agar Frontend dapat berkomunikasi dengan Backend lintas origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://3.233.82.68",       
+        "http://3.233.82.68:80"   
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def get_db():
-    return mysql.connector.connect(
-        host=os.getenv("DB_HOST"),
-        port=int(os.getenv("DB_PORT", 3306)),
-        database=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-    )
+# Konfigurasi Database Pooling
+db_config = {
+    "pool_name": "kas_rw_pool",
+    "pool_size": 5,
+    "host": "localhost",
+    "user": "root",
+    "password": "@password123",  
+    "database": "kas_rw_db"
+}
 
-class TransaksiBase(BaseModel):
+try:
+    connection_pool = pooling.MySQLConnectionPool(**db_config)
+except mysql.connector.Error as err:
+    print(f"Error Database Connection Pool: {err}")
+    connection_pool = None
+
+def get_db():
+    """Dependency untuk mendapatkan koneksi database dari pool."""
+    if connection_pool is None:
+        raise HTTPException(status_code=500, detail="Koneksi database tidak tersedia.")
+    connection = connection_pool.get_connection()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+# --- MODEL DATA (Pydantic) ---
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    role: str
+
+class LoginResponse(BaseModel):
+    success: bool
+    username: str
+    role: str
+    message: str
+
+class TransaksiCreate(BaseModel):
     tanggal: date
-    keterangan: str
-    jenis: str      # 'pemasukan' atau 'pengeluaran'
-    jumlah: float
+    jenis: str = Field(..., description="Harus 'pemasukan' atau 'pengeluaran'")
+    jumlah: float = Field(..., gt=0, description="Jumlah nominal harus lebih dari 0")
+    keterangan: str = Field(..., min_length=15, description="Keterangan wajib detail minimal 15 karakter untuk mencegah markup")
+    username_admin: str
 
 class TransaksiUpdate(BaseModel):
-    tanggal: Optional[date] = None
-    keterangan: Optional[str] = None
-    jenis: Optional[str] = None
-    jumlah: Optional[float] = None
+    tanggal: date
+    jumlah: float = Field(..., gt=0)
+    keterangan: str = Field(..., min_length=15)
 
-@app.get("/")
-def root():
-    return {"message": "Kas RW API berjalan"}
+# --- ENDPOINTS API ---
 
-@app.get("/transaksi")
-def get_all():
-    db = get_db()
+@app.post("/api/login", response_model=LoginResponse)
+def login(payload: LoginRequest, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
-
-    cursor.execute(
-        "SELECT * FROM transaksi ORDER BY tanggal DESC"
-    )
-
-    rows = cursor.fetchall()
-    db.close()
-
-    return rows
-
-@app.get("/transaksi/{id}")
-def get_one(id: int):
-    db = get_db()
-    cursor = db.cursor(dictionary=True)
-
-    cursor.execute(
-        "SELECT * FROM transaksi WHERE id = %s",
-        (id,)
-    )
-
-    row = cursor.fetchone()
-    db.close()
-
-    if not row:
+    query = "SELECT username, role FROM users WHERE username = %s AND password = %s AND role = %s"
+    cursor.execute(query, (payload.username, payload.password, payload.role))
+    user = cursor.fetchone()
+    cursor.close()
+    
+    if not user:
         raise HTTPException(
-            status_code=404,
-            detail="Transaksi tidak ditemukan"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Kredensial salah atau Role tidak sesuai. Akses ditolak."
         )
+    
+    return {
+        "success": True,
+        "username": user["username"],
+        "role": user["role"],
+        "message": f"Selamat datang {user['username']} sebagai {user['role']}"
+    }
 
-    return row
+@app.get("/api/transaksi")
+def get_all_transaksi(db=Depends(get_db)):
+    cursor = db.cursor(dictionary=True)
+    
+    # Ambil riwayat urut dari yang terbaru
+    query_history = "SELECT id, DATE_FORMAT(tanggal, '%Y-%m-%d') as tanggal, jenis, jumlah, keterangan, username_admin FROM transaksi ORDER BY tanggal DESC, id DESC"
+    cursor.execute(query_history)
+    riwayat = cursor.fetchall()
+    
+    # Hitung Rekapitulasi Ringkasan Keuangan
+    query_summary = """
+        SELECT 
+            COALESCE(SUM(CASE WHEN jenis = 'pemasukan' THEN jumlah ELSE 0 END), 0) as total_pemasukan,
+            COALESCE(SUM(CASE WHEN jenis = 'pengeluaran' THEN jumlah ELSE 0 END), 0) as total_pengeluaran
+        FROM transaksi
+    """
+    cursor.execute(query_summary)
+    summary = cursor.fetchone()
+    cursor.close()
+    
+    total_pemasukan = float(summary["total_pemasukan"])
+    total_pengeluaran = float(summary["total_pengeluaran"])
+    saldo_berjalan = total_pemasukan - total_pengeluaran
+    
+    return {
+        "saldo_berjalan": saldo_berjalan,
+        "total_pemasukan": total_pemasukan,
+        "total_pengeluaran": total_pengeluaran,
+        "data": riwayat
+    }
 
-@app.post("/transaksi", status_code=201)
-def create(data: TransaksiBase):
-    db = get_db()
+@app.post("/api/transaksi", status_code=status.HTTP_21_CREATED)
+def create_transaksi(payload: TransaksiCreate, db=Depends(get_db)):
+    if payload.jenis not in ['pemasukan', 'pengeluaran']:
+        raise HTTPException(status_code=400, detail="Jenis transaksi tidak valid.")
+        
     cursor = db.cursor()
+    query = """
+        INSERT INTO transaksi (tanggal, jenis, jumlah, keterangan, username_admin)
+        VALUES (%s, %s, %s, %s, %s)
+    """
+    try:
+        cursor.execute(query, (payload.tanggal, payload.jenis, payload.jumlah, payload.keterangan, payload.username_admin))
+        db.commit()
+        cursor.close()
+        return {"success": True, "message": "Data transaksi berhasil disimpan secara transparan."}
+    except mysql.connector.Error as err:
+        db.rollback()
+        cursor.close()
+        raise HTTPException(status_code=500, detail=f"Gagal menyimpan data: {err}")
 
-    cursor.execute("INSERT INTO transaksi (tanggal, keterangan, jenis, jumlah) VALUES (%s, %s, %s, %s)",
-        (data.tanggal, data.keterangan, data.jenis, data.jumlah),
-    )
-
-    db.commit()
-
-    new_id = cursor.lastrowid
-
-    db.close()
-
-    return {
-        "id": new_id,
-        "message": "Transaksi berhasil ditambahkan"
-    }
-
-@app.put("/transaksi/{id}")
-def update(id: int, data: TransaksiUpdate):
-    db = get_db()
-    cursor = db.cursor(dictionary=True)
-
-    cursor.execute(
-        "SELECT * FROM transaksi WHERE id = %s",
-        (id,)
-    )
-
-    row = cursor.fetchone()
-
-    if not row:
-        db.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="Transaksi tidak ditemukan"
-        )
-
-    updated = {
-        **row,
-        **{
-            k: v for k, v in data.dict().items()
-            if v is not None
-        }
-    }
-
-    cursor.execute(
-        """
-        UPDATE transaksi
-        SET tanggal=%s,
-            keterangan=%s,
-            jenis=%s,
-            jumlah=%s
-        WHERE id=%s
-        """,
-        (
-            updated["tanggal"],
-            updated["keterangan"],
-            updated["jenis"],
-            updated["jumlah"],
-            id
-        ),
-    )
-
-    db.commit()
-    db.close()
-
-    return {
-        "message": "Transaksi berhasil diperbarui"
-    }
-
-@app.delete("/transaksi/{id}")
-def delete(id: int):
-    db = get_db()
+@app.put("/api/transaksi/{transaksi_id}")
+def update_transaksi(transaksi_id: int, payload: TransaksiUpdate, db=Depends(get_db)):
     cursor = db.cursor()
+    # Pastikan data yang akan diupdate ada di database
+    check_query = "SELECT id FROM transaksi WHERE id = %s"
+    cursor.execute(check_query, (transaksi_id,))
+    if not cursor.fetchone():
+        cursor.close()
+        raise HTTPException(status_code=404, detail="Data transaksi tidak ditemukan.")
+        
+    update_query = """
+        UPDATE transaksi 
+        SET tanggal = %s, jumlah = %s, keterangan = %s 
+        WHERE id = %s
+    """
+    try:
+        cursor.execute(update_query, (payload.tanggal, payload.jumlah, payload.keterangan, transaksi_id))
+        db.commit()
+        cursor.close()
+        return {"success": True, "message": "Data transaksi berhasil diperbarui."}
+    except mysql.connector.Error as err:
+        db.rollback()
+        cursor.close()
+        raise HTTPException(status_code=500, detail=f"Gagal memperbarui data: {err}")
 
-    cursor.execute(
-        "DELETE FROM transaksi WHERE id = %s",
-        (id,)
-    )
+@app.delete("/api/transaksi/{transaksi_id}")
+def delete_transaksi(transaksi_id: int, db=Depends(get_db)):
+    cursor = db.cursor()
+    check_query = "SELECT id FROM transaksi WHERE id = %s"
+    cursor.execute(check_query, (transaksi_id,))
+    if not cursor.fetchone():
+        cursor.close()
+        raise HTTPException(status_code=404, detail="Data transaksi tidak ditemukan.")
+        
+    delete_query = "DELETE FROM transaksi WHERE id = %s"
+    try:
+        cursor.execute(delete_query, (transaksi_id,))
+        db.commit()
+        cursor.close()
+        return {"success": True, "message": "Data transaksi berhasil dihapus dari sistem."}
+    except mysql.connector.Error as err:
+        db.rollback()
+        cursor.close()
+        raise HTTPException(status_code=500, detail=f"Gagal menghapus data: {err}")
 
-    db.commit()
-
-    affected = cursor.rowcount
-
-    db.close()
-
-    if affected == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Transaksi tidak ditemukan"
-        )
-
-    return {
-        "message": "Transaksi berhasil dihapus"
-    }
+if __name__ == "__main__":
+    import uvicorn
+    # Menggunakan 0.0.0.0 agar backend bisa diakses secara publik via IP 18.210.54.99
+    uvicorn.run("main.py:app", host="0.0.0.0", port=8000, reload=True)
